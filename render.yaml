@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: darglobal-wasalt-backend
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false # User enters this in Render dashboard
+      - key: OPENROUTER_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: PRIMARY_MODEL
+        value: meta-llama/llama-3.3-70b-instruct:free
+      - key: FALLBACK_MODEL
+        value: qwen/qwen-2.5-72b-instruct:free
+      - key: CHROMA_PERSIST_DIRECTORY
+        value: data/chroma
+      - key: PORT
+        value: 8000

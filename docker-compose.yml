@@ -1,0 +1,21 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: realestate-chatbot-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+      - PRIMARY_MODEL=meta-llama/llama-3.3-70b-instruct:free
+      - FALLBACK_MODEL=qwen/qwen-2.5-72b-instruct:free
+      - CHROMA_PERSIST_DIRECTORY=data/chroma
+      - PORT=8000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

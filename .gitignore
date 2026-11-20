@@ -1,0 +1,6 @@
+.env
+.dockerignore
+/venv
+__init__.py
+/__pycache__
+/frontend/node_modules
