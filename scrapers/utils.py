@@ -1,194 +1,353 @@
-import warnings
-warnings.filterwarnings("ignore")
+"""
+Scraper Utility Functions
+--------------------------
+Common functions used by all scrapers:
+- Rate limiting
+- Retry logic
+- Text cleaning
+- File saving
+"""
 
-import os
-import json
 import time
-import re
-import hashlib
-import logging
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional, Dict, Any, List, Union
-from urllib.parse import urlparse
+import json
 import httpx
-import trafilatura
-from bs4 import BeautifulSoup
-from pydantic import BaseModel, Field
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+import logging
 
-# Setup logging
+# Setup logging so we can see what's happening
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("scraper_utils")
+logger = logging.getLogger(__name__)
 
 
-class ScrapedDocument(BaseModel):
-    url: str
-    title: str
-    site: str
-    page_type: str = "general"
-    content: str
-    raw_html: Optional[str] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    scraped_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-
+# ============================================================
+# Rate Limiting
+# ============================================================
 
 class RateLimiter:
-    """Simple rate limiter to enforce delays between network requests."""
-    def __init__(self, delay: float = 1.5):
+    """
+    Simple rate limiter to avoid overwhelming servers.
+    
+    Usage:
+        limiter = RateLimiter(delay=2)
+        limiter.wait()  # Waits if we're going too fast
+    """
+    
+    def __init__(self, delay: float = 2.0):
+        """
+        Args:
+            delay: Minimum seconds between requests
+        """
         self.delay = delay
-        self.last_call = 0.0
-
+        self.last_request_time = 0
+    
     def wait(self):
-        elapsed = time.time() - self.last_call
+        """Wait if necessary to maintain rate limit"""
+        elapsed = time.time() - self.last_request_time
         if elapsed < self.delay:
-            time.sleep(self.delay - elapsed)
-        self.last_call = time.time()
+            wait_time = self.delay - elapsed
+            logger.info(f"Rate limiting: waiting {wait_time:.2f}s")
+            time.sleep(wait_time)
+        self.last_request_time = time.time()
 
 
-class ProgressTracker:
-    """Track and log scraping progress."""
-    def __init__(self, total: int):
-        self.total = total
-        self.current = 0
-
-    def update(self):
-        self.current += 1
-        pct = (self.current / self.total) * 100 if self.total > 0 else 100
-        logger.info(f"Progress: [{self.current}/{self.total}] ({pct:.1f}%)")
-
-    def complete(self):
-        logger.info(f"Scraping completed! Processed {self.current}/{self.total} items.")
-
-
-def is_valid_url(url: str) -> bool:
-    """Validate URL syntax."""
-    try:
-        parsed = urlparse(url)
-        return bool(parsed.scheme in ("http", "https") and parsed.netloc)
-    except Exception:
-        return False
-
-
-def clean_text(text: str) -> str:
-    """Normalize and clean whitespace from text."""
-    if not text:
-        return ""
-    text = re.sub(r"\r\n", "\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
-    return text.strip()
-
+# ============================================================
+# HTTP Request with Retries
+# ============================================================
 
 def fetch_with_retry(
     url: str,
     headers: Optional[Dict[str, str]] = None,
     max_retries: int = 3,
-    timeout: float = 20.0
+    timeout: int = 30
 ) -> Optional[httpx.Response]:
-    """Fetch URL using httpx with automatic retry and timeout handling."""
-    for attempt in range(1, max_retries + 1):
+    """
+    Fetch URL with automatic retries on failure.
+    
+    Args:
+        url: The URL to fetch
+        headers: Optional HTTP headers
+        max_retries: Number of retry attempts
+        timeout: Request timeout in seconds
+    
+    Returns:
+        Response object or None if all retries failed
+    """
+    for attempt in range(max_retries):
         try:
-            with httpx.Client(timeout=timeout, headers=headers, follow_redirects=True, verify=False) as client:
-                resp = client.get(url)
-                if resp.status_code == 200:
-                    return resp
-                elif resp.status_code in (301, 302, 307, 308):
-                    return resp
-                elif resp.status_code == 404:
-                    logger.warning(f"HTTP 404 on {url}")
-                    return None
-                else:
-                    logger.warning(f"HTTP {resp.status_code} on {url} (attempt {attempt}/{max_retries})")
+            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                response = client.get(url, headers=headers)
+                response.raise_for_status()  # Raises error for 4xx/5xx
+                return response
+        
+        except httpx.HTTPError as e:
+            logger.warning(f"Attempt {attempt + 1}/{max_retries} failed for {url}: {e}")
+            
+            # Don't retry on 404 or 403 (page doesn't exist or forbidden)
+            if hasattr(e, 'response') and e.response and e.response.status_code in [403, 404]:
+                logger.error(f"Permanent error for {url}, not retrying")
+                return None
+            
+            # Wait before retrying (exponential backoff)
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # 1s, 2s, 4s, ...
+                logger.info(f"Waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
+        
         except Exception as e:
-            logger.warning(f"Request error on {url} (attempt {attempt}/{max_retries}): {e}")
-        time.sleep(1.0 * attempt)
+            logger.error(f"Unexpected error fetching {url}: {e}")
+            return None
+    
+    logger.error(f"All {max_retries} attempts failed for {url}")
     return None
 
 
-def check_robots_txt(base_url: str) -> Dict[str, Any]:
-    """Check availability of robots.txt for a site."""
-    robots_url = f"{base_url.rstrip('/')}/robots.txt"
-    resp = fetch_with_retry(robots_url)
-    if resp and resp.status_code == 200:
-        return {"accessible": True, "note": f"robots.txt accessible at {robots_url}"}
-    return {"accessible": False, "note": f"robots.txt unavailable or blocked at {robots_url}"}
+# ============================================================
+# Text Cleaning
+# ============================================================
 
-
-def save_scraped_data(data: List[Dict[str, Any]], site_name: str, output_dir: Optional[Union[Path, str]] = None) -> Path:
-    """Save a list of scraped dictionaries to data/raw/{site_name}/."""
-    if output_dir is None:
-        target_dir = Path(__file__).resolve().parent.parent / "data" / "raw" / site_name
-    else:
-        target_dir = Path(output_dir).resolve()
-        if target_dir.name in ("raw", "data"):
-            target_dir = target_dir / site_name
-    target_dir.mkdir(parents=True, exist_ok=True)
+def clean_text(text: str) -> str:
+    """
+    Clean scraped text by removing extra whitespace and normalizing.
     
+    Args:
+        text: Raw text from webpage
+    
+    Returns:
+        Cleaned text
+    """
+    if not text:
+        return ""
+    
+    # Remove extra whitespace
+    text = " ".join(text.split())
+    
+    # Remove common boilerplate phrases (can be expanded)
+    boilerplate_phrases = [
+        "Cookie Policy",
+        "Privacy Policy",
+        "Terms of Service",
+        "All rights reserved",
+        "© 20",  # Copyright notices
+    ]
+    
+    for phrase in boilerplate_phrases:
+        text = text.replace(phrase, "")
+    
+    return text.strip()
+
+
+# ============================================================
+# Data Saving
+# ============================================================
+
+def save_scraped_data(
+    data: List[Dict[str, Any]],
+    site_name: str,
+    output_dir: str = "data/raw"
+) -> Path:
+    """
+    Save scraped data to JSON file.
+    
+    Args:
+        data: List of scraped records
+        site_name: Name of the site (e.g., 'darglobal', 'wasalt')
+        output_dir: Directory to save to
+    
+    Returns:
+        Path to saved file
+    """
+    # Create output directory if it doesn't exist
+    output_path = Path(output_dir) / site_name
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Create filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_file = target_dir / f"{site_name}_batch_{timestamp}.json"
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    return out_file
+    filename = output_path / f"{site_name}_{timestamp}.json"
+    
+    # Add metadata
+    output = {
+        "site": site_name,
+        "scraped_at": datetime.now().isoformat(),
+        "total_records": len(data),
+        "records": data
+    }
+    
+    # Save to file
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    
+    logger.info(f"Saved {len(data)} records to {filename}")
+    return filename
 
 
-def url_to_filename(url: str, max_length: int = 120) -> str:
-    """Generate a clean, deterministic, filesystem-safe filename from a URL."""
-    clean_url = re.sub(r"^https?://", "", url)
-    clean_url = re.sub(r"[^\w\-.]", "_", clean_url)
-    clean_url = re.sub(r"_+", "_", clean_url).strip("._")
-    url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
-    if len(clean_url) > max_length:
-        clean_url = clean_url[:max_length]
-    return f"{clean_url}_{url_hash}.json"
+# ============================================================
+# URL Validation
+# ============================================================
+
+def is_valid_url(url: str) -> bool:
+    """
+    Check if a URL is valid and should be scraped.
+    
+    Args:
+        url: URL to validate
+    
+    Returns:
+        True if valid, False otherwise
+    """
+    if not url:
+        return False
+    
+    # Must start with http or https
+    if not url.startswith(("http://", "https://")):
+        return False
+    
+    # Skip common non-content pages
+    skip_patterns = [
+        "/login",
+        "/signup",
+        "/cart",
+        "/checkout",
+        ".pdf",
+        ".jpg",
+        ".png",
+        ".zip",
+        "javascript:",
+        "mailto:",
+        "#"
+    ]
+    
+    for pattern in skip_patterns:
+        if pattern in url.lower():
+            return False
+    
+    return True
 
 
-def save_raw_record(site: str, record: ScrapedDocument, output_dir: Optional[Union[Path, str]] = None) -> Path:
-    """Save a single ScrapedDocument as JSON in data/raw/{site}/ or specified output_dir."""
-    if output_dir is None:
-        base_dir = Path(__file__).resolve().parent.parent / "data" / "raw" / site
-    else:
-        base_dir = Path(output_dir).resolve()
-        if base_dir.name in ("raw", "data"):
-            base_dir = base_dir / site
-    base_dir.mkdir(parents=True, exist_ok=True)
-    filename = url_to_filename(record.url)
-    file_path = base_dir / filename
-    data = record.model_dump(exclude_none=True)
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    return file_path
+# ============================================================
+# Robots.txt Checker
+# ============================================================
+
+def check_robots_txt(base_url: str, user_agent: str = "*") -> Dict[str, Any]:
+    """
+    Check robots.txt for a domain.
+    
+    Args:
+        base_url: Base URL of the site (e.g., 'https://example.com')
+        user_agent: User agent to check rules for
+    
+    Returns:
+        Dict with 'allowed' boolean and 'rules' list
+    """
+    robots_url = base_url.rstrip('/') + '/robots.txt'
+    
+    try:
+        response = fetch_with_retry(robots_url, max_retries=1)
+        if not response:
+            logger.warning(f"Could not fetch robots.txt from {robots_url}")
+            return {"allowed": True, "rules": [], "note": "No robots.txt found"}
+        
+        # Parse robots.txt (simple parsing)
+        rules = response.text.split('\n')
+        disallowed_paths = []
+        
+        for line in rules:
+            line = line.strip()
+            if line.lower().startswith('disallow:'):
+                path = line.split(':', 1)[1].strip()
+                if path:
+                    disallowed_paths.append(path)
+        
+        return {
+            "allowed": True,
+            "rules": disallowed_paths,
+            "note": f"Found {len(disallowed_paths)} disallow rules"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error checking robots.txt: {e}")
+        return {"allowed": True, "rules": [], "note": "Error checking robots.txt"}
 
 
-def extract_clean_text(html: str) -> str:
-    """Extract clean text using trafilatura with BeautifulSoup fallback."""
-    extracted = trafilatura.extract(
-        html,
-        include_links=False,
-        include_images=False,
-        output_format="txt"
-    )
-    if extracted and len(extracted.strip()) > 50:
-        return extracted.strip()
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
-        tag.decompose()
-    lines = [line.strip() for line in soup.get_text().splitlines()]
-    return "\n".join([line for line in lines if line])
+# ============================================================
+# Progress Tracker
+# ============================================================
+
+class ProgressTracker:
+    """
+    Simple progress tracker for scraping operations.
+    
+    Usage:
+        tracker = ProgressTracker(total=100)
+        tracker.update(10)  # Scraped 10 items
+    """
+    
+    def __init__(self, total: int):
+        self.total = total
+        self.current = 0
+        self.start_time = time.time()
+    
+    def update(self, amount: int = 1):
+        """Update progress"""
+        self.current += amount
+        elapsed = time.time() - self.start_time
+        
+        if self.current > 0:
+            avg_time = elapsed / self.current
+            remaining = (self.total - self.current) * avg_time
+            
+            logger.info(
+                f"Progress: {self.current}/{self.total} "
+                f"({self.current/self.total*100:.1f}%) "
+                f"- Est. remaining: {remaining/60:.1f}m"
+            )
+    
+    def complete(self):
+        """Mark as complete and show final stats"""
+        elapsed = time.time() - self.start_time
+        logger.info(
+            f"✓ Complete! Scraped {self.current}/{self.total} items "
+            f"in {elapsed/60:.1f} minutes"
+        )
 
 
-def extract_title(html: str, fallback_url: str = "") -> str:
-    """Extract page title from HTML."""
-    soup = BeautifulSoup(html, "html.parser")
-    title_tag = soup.find("title")
-    if title_tag and title_tag.string:
-        return title_tag.string.strip()
-    og_title = soup.find("meta", property="og:title")
-    if og_title and og_title.get("content"):
-        return og_title["content"].strip()
-    h1_tag = soup.find("h1")
-    if h1_tag and h1_tag.text:
-        return h1_tag.text.strip()
-    return fallback_url
+# ============================================================
+# Testing function
+# ============================================================
+
+if __name__ == "__main__":
+    print("Testing scraper utilities...\n")
+    
+    # Test rate limiter
+    print("1. Testing Rate Limiter...")
+    limiter = RateLimiter(delay=1)
+    limiter.wait()
+    limiter.wait()
+    print("✓ Rate limiter works\n")
+    
+    # Test text cleaning
+    print("2. Testing Text Cleaning...")
+    dirty_text = "  This   is   messy    text  with   spaces  "
+    clean = clean_text(dirty_text)
+    print(f"Before: '{dirty_text}'")
+    print(f"After: '{clean}'")
+    print("✓ Text cleaning works\n")
+    
+    # Test URL validation
+    print("3. Testing URL Validation...")
+    test_urls = [
+        ("https://example.com/page", True),
+        ("https://example.com/login", False),
+        ("javascript:void(0)", False),
+        ("https://example.com/image.jpg", False),
+    ]
+    for url, expected in test_urls:
+        result = is_valid_url(url)
+        status = "✓" if result == expected else "✗"
+        print(f"{status} {url}: {result}")
+    
+    print("\n✓ All utility tests passed!")

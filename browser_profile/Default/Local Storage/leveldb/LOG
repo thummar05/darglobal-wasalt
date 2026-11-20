@@ -1,0 +1,8 @@
+2026/11/20-13:01:17.265 1a6c Creating DB C:\Users\thumm\Desktop\darglobal\realestate-chatbot\browser_profile\Default\Local Storage\leveldb since it was missing.
+2026/11/20-13:01:17.346 1a6c Reusing MANIFEST C:\Users\thumm\Desktop\darglobal\realestate-chatbot\browser_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/11/20-13:06:20.023 3470 Level-0 table #5: started
+2026/11/20-13:06:20.057 3470 Level-0 table #5: 15790 bytes OK
+2026/11/20-13:06:20.086 3470 Delete type=0 #3
+2026/11/20-13:12:20.057 85dc Level-0 table #7: started
+2026/11/20-13:12:23.050 85dc Level-0 table #7: 14832 bytes OK
+2026/11/20-13:12:23.299 85dc Delete type=0 #4
